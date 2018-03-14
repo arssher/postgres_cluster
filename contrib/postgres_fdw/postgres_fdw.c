@@ -134,7 +134,7 @@ typedef struct PgFdwScanState
 	List	   *retrieved_attrs;	/* list of retrieved attribute numbers */
 
 	/* for remote query execution */
-	PGconn	   *conn;			/* connection for the scan */
+	ConnCacheEntry	*conn_entry;	/* connection for the scan */
 	unsigned int cursor_number; /* quasi-unique ID for my cursor */
 	bool		cursor_exists;	/* have we created the cursor? */
 	int			numParams;		/* number of parameters passed to query */
@@ -167,7 +167,7 @@ typedef struct PgFdwModifyState
 	AttInMetadata *attinmeta;	/* attribute datatype conversion metadata */
 
 	/* for remote query execution */
-	PGconn	   *conn;			/* connection for the scan */
+	ConnCacheEntry	*conn_entry; /* connection for modification */
 	char	   *p_name;			/* name of prepared statement, if created */
 
 	/* extracted fdw_private data */
@@ -200,7 +200,7 @@ typedef struct PgFdwDirectModifyState
 	bool		set_processed;	/* do we set the command es_processed? */
 
 	/* for remote query execution */
-	PGconn	   *conn;			/* connection for the update */
+	ConnCacheEntry *conn_entry;	/* connection for the update */
 	int			numParams;		/* number of parameters passed to query */
 	FmgrInfo   *param_flinfo;	/* output conversion functions for them */
 	List	   *param_exprs;	/* executable expressions for param values */
@@ -373,7 +373,7 @@ static void estimate_path_cost_size(PlannerInfo *root,
 						double *p_rows, int *p_width,
 						Cost *p_startup_cost, Cost *p_total_cost);
 static void get_remote_estimate(const char *sql,
-					PGconn *conn,
+					ConnCacheEntry *conn_entry,
 					double *rows,
 					int *width,
 					Cost *startup_cost,
@@ -383,7 +383,7 @@ static bool ec_member_matches_foreign(PlannerInfo *root, RelOptInfo *rel,
 						  void *arg);
 static void create_cursor(ForeignScanState *node);
 static void fetch_more_data(ForeignScanState *node);
-static void close_cursor(PGconn *conn, unsigned int cursor_number);
+static void close_cursor(ConnCacheEntry *entry, unsigned int cursor_number);
 static PgFdwModifyState *create_foreign_modify(EState *estate,
 					  RangeTblEntry *rte,
 					  ResultRelInfo *resultRelInfo,
@@ -1359,10 +1359,10 @@ postgresBeginForeignScan(ForeignScanState *node, int eflags)
 	 * Get connection to the foreign server.  Connection manager will
 	 * establish new connection if necessary.
 	 */
-	fsstate->conn = GetConnection(user, false);
+	fsstate->conn_entry = GetConnection(user, false);
 
 	/* Assign a unique ID for my cursor */
-	fsstate->cursor_number = GetCursorNumber(fsstate->conn);
+	fsstate->cursor_number = GetCursorNumber(fsstate->conn_entry);
 	fsstate->cursor_exists = false;
 
 	/* Get private info created by planner functions. */
@@ -1497,9 +1497,10 @@ postgresReScanForeignScan(ForeignScanState *node)
 	 * We don't use a PG_TRY block here, so be careful not to throw error
 	 * without releasing the PGresult.
 	 */
-	res = pgfdw_exec_query(fsstate->conn, sql);
+	res = pgfdw_exec_query(fsstate->conn_entry, sql);
 	if (PQresultStatus(res) != PGRES_COMMAND_OK)
-		pgfdw_report_error(ERROR, res, fsstate->conn, true, sql);
+		pgfdw_report_error(ERROR, res, ConnectionEntryGetConn(fsstate->conn_entry),
+															  true, sql);
 	PQclear(res);
 
 	/* Now force a fresh FETCH. */
@@ -1525,11 +1526,11 @@ postgresEndForeignScan(ForeignScanState *node)
 
 	/* Close the cursor if open, to prevent accumulation of cursors */
 	if (fsstate->cursor_exists)
-		close_cursor(fsstate->conn, fsstate->cursor_number);
+		close_cursor(fsstate->conn_entry, fsstate->cursor_number);
 
 	/* Release remote connection */
-	ReleaseConnection(fsstate->conn);
-	fsstate->conn = NULL;
+	ReleaseConnection(fsstate->conn_entry);
+	fsstate->conn_entry = NULL;
 
 	/* MemoryContexts will be deleted automatically. */
 }
@@ -1754,6 +1755,8 @@ postgresExecForeignInsert(EState *estate,
 {
 	PgFdwModifyState *fmstate = (PgFdwModifyState *) resultRelInfo->ri_FdwState;
 	const char **p_values;
+	ConnCacheEntry *entry = fmstate->conn_entry;
+	PGconn	   *conn = ConnectionEntryGetConn(entry);
 	PGresult   *res;
 	int			n_rows;
 
@@ -1767,14 +1770,14 @@ postgresExecForeignInsert(EState *estate,
 	/*
 	 * Execute the prepared statement.
 	 */
-	if (!PQsendQueryPrepared(fmstate->conn,
+	if (!PQsendQueryPrepared(conn,
 							 fmstate->p_name,
 							 fmstate->p_nums,
 							 p_values,
 							 NULL,
 							 NULL,
 							 0))
-		pgfdw_report_error(ERROR, NULL, fmstate->conn, false, fmstate->query);
+		pgfdw_report_error(ERROR, NULL, conn, false, fmstate->query);
 
 	/*
 	 * Get the result, and check for success.
@@ -1782,10 +1785,10 @@ postgresExecForeignInsert(EState *estate,
 	 * We don't use a PG_TRY block here, so be careful not to throw error
 	 * without releasing the PGresult.
 	 */
-	res = pgfdw_get_result(fmstate->conn, fmstate->query);
+	res = pgfdw_get_result(entry, fmstate->query);
 	if (PQresultStatus(res) !=
 		(fmstate->has_returning ? PGRES_TUPLES_OK : PGRES_COMMAND_OK))
-		pgfdw_report_error(ERROR, res, fmstate->conn, true, fmstate->query);
+		pgfdw_report_error(ERROR, res, conn, true, fmstate->query);
 
 	/* Check number of rows affected, and fetch RETURNING tuple if any */
 	if (fmstate->has_returning)
@@ -1820,6 +1823,8 @@ postgresExecForeignUpdate(EState *estate,
 	Datum		datum;
 	bool		isNull;
 	const char **p_values;
+	ConnCacheEntry *entry = fmstate->conn_entry;
+	PGconn	   *conn = ConnectionEntryGetConn(entry);
 	PGresult   *res;
 	int			n_rows;
 
@@ -1843,14 +1848,14 @@ postgresExecForeignUpdate(EState *estate,
 	/*
 	 * Execute the prepared statement.
 	 */
-	if (!PQsendQueryPrepared(fmstate->conn,
+	if (!PQsendQueryPrepared(conn,
 							 fmstate->p_name,
 							 fmstate->p_nums,
 							 p_values,
 							 NULL,
 							 NULL,
 							 0))
-		pgfdw_report_error(ERROR, NULL, fmstate->conn, false, fmstate->query);
+		pgfdw_report_error(ERROR, NULL, conn, false, fmstate->query);
 
 	/*
 	 * Get the result, and check for success.
@@ -1858,10 +1863,10 @@ postgresExecForeignUpdate(EState *estate,
 	 * We don't use a PG_TRY block here, so be careful not to throw error
 	 * without releasing the PGresult.
 	 */
-	res = pgfdw_get_result(fmstate->conn, fmstate->query);
+	res = pgfdw_get_result(entry, fmstate->query);
 	if (PQresultStatus(res) !=
 		(fmstate->has_returning ? PGRES_TUPLES_OK : PGRES_COMMAND_OK))
-		pgfdw_report_error(ERROR, res, fmstate->conn, true, fmstate->query);
+		pgfdw_report_error(ERROR, res, conn, true, fmstate->query);
 
 	/* Check number of rows affected, and fetch RETURNING tuple if any */
 	if (fmstate->has_returning)
@@ -1896,6 +1901,8 @@ postgresExecForeignDelete(EState *estate,
 	Datum		datum;
 	bool		isNull;
 	const char **p_values;
+	ConnCacheEntry *entry = fmstate->conn_entry;
+	PGconn	   *conn = ConnectionEntryGetConn(entry);
 	PGresult   *res;
 	int			n_rows;
 
@@ -1919,14 +1926,14 @@ postgresExecForeignDelete(EState *estate,
 	/*
 	 * Execute the prepared statement.
 	 */
-	if (!PQsendQueryPrepared(fmstate->conn,
+	if (!PQsendQueryPrepared(conn,
 							 fmstate->p_name,
 							 fmstate->p_nums,
 							 p_values,
 							 NULL,
 							 NULL,
 							 0))
-		pgfdw_report_error(ERROR, NULL, fmstate->conn, false, fmstate->query);
+		pgfdw_report_error(ERROR, NULL, conn, false, fmstate->query);
 
 	/*
 	 * Get the result, and check for success.
@@ -1934,10 +1941,10 @@ postgresExecForeignDelete(EState *estate,
 	 * We don't use a PG_TRY block here, so be careful not to throw error
 	 * without releasing the PGresult.
 	 */
-	res = pgfdw_get_result(fmstate->conn, fmstate->query);
+	res = pgfdw_get_result(entry, fmstate->query);
 	if (PQresultStatus(res) !=
 		(fmstate->has_returning ? PGRES_TUPLES_OK : PGRES_COMMAND_OK))
-		pgfdw_report_error(ERROR, res, fmstate->conn, true, fmstate->query);
+		pgfdw_report_error(ERROR, res, conn, true, fmstate->query);
 
 	/* Check number of rows affected, and fetch RETURNING tuple if any */
 	if (fmstate->has_returning)
@@ -2404,7 +2411,7 @@ postgresBeginDirectModify(ForeignScanState *node, int eflags)
 	 * Get connection to the foreign server.  Connection manager will
 	 * establish new connection if necessary.
 	 */
-	dmstate->conn = GetConnection(user, false);
+	dmstate->conn_entry = GetConnection(user, false);
 
 	/* Update the foreign-join-related fields. */
 	if (fsplan->scan.scanrelid == 0)
@@ -2536,8 +2543,8 @@ postgresEndDirectModify(ForeignScanState *node)
 		PQclear(dmstate->result);
 
 	/* Release remote connection */
-	ReleaseConnection(dmstate->conn);
-	dmstate->conn = NULL;
+	ReleaseConnection(dmstate->conn_entry);
+	dmstate->conn_entry = NULL;
 
 	/* close the target relation. */
 	if (dmstate->resultRel)
@@ -2659,7 +2666,7 @@ estimate_path_cost_size(PlannerInfo *root,
 		List	   *remote_param_join_conds;
 		List	   *local_param_join_conds;
 		StringInfoData sql;
-		PGconn	   *conn;
+		ConnCacheEntry *conn_entry;
 		Selectivity local_sel;
 		QualCost	local_cost;
 		List	   *fdw_scan_tlist = NIL;
@@ -2701,10 +2708,10 @@ estimate_path_cost_size(PlannerInfo *root,
 								&retrieved_attrs, NULL);
 
 		/* Get the remote estimate */
-		conn = GetConnection(fpinfo->user, false);
-		get_remote_estimate(sql.data, conn, &rows, &width,
+		conn_entry = GetConnection(fpinfo->user, false);
+		get_remote_estimate(sql.data, conn_entry, &rows, &width,
 							&startup_cost, &total_cost);
-		ReleaseConnection(conn);
+		ReleaseConnection(conn_entry);
 
 		retrieved_rows = rows;
 
@@ -2982,7 +2989,7 @@ estimate_path_cost_size(PlannerInfo *root,
  * The given "sql" must be an EXPLAIN command.
  */
 static void
-get_remote_estimate(const char *sql, PGconn *conn,
+get_remote_estimate(const char *sql, ConnCacheEntry *conn_entry,
 					double *rows, int *width,
 					Cost *startup_cost, Cost *total_cost)
 {
@@ -2998,9 +3005,10 @@ get_remote_estimate(const char *sql, PGconn *conn,
 		/*
 		 * Execute EXPLAIN remotely.
 		 */
-		res = pgfdw_exec_query(conn, sql);
+		res = pgfdw_exec_query(conn_entry, sql);
 		if (PQresultStatus(res) != PGRES_TUPLES_OK)
-			pgfdw_report_error(ERROR, res, conn, false, sql);
+			pgfdw_report_error(ERROR, res, ConnectionEntryGetConn(conn_entry),
+							   false, sql);
 
 		/*
 		 * Extract cost numbers for topmost plan node.  Note we search for a
@@ -3069,7 +3077,8 @@ create_cursor(ForeignScanState *node)
 	ExprContext *econtext = node->ss.ps.ps_ExprContext;
 	int			numParams = fsstate->numParams;
 	const char **values = fsstate->param_values;
-	PGconn	   *conn = fsstate->conn;
+	ConnCacheEntry *entry = fsstate->conn_entry;
+	PGconn	   *conn = ConnectionEntryGetConn(entry);
 	StringInfoData buf;
 	PGresult   *res;
 
@@ -3114,7 +3123,7 @@ create_cursor(ForeignScanState *node)
 	 * We don't use a PG_TRY block here, so be careful not to throw error
 	 * without releasing the PGresult.
 	 */
-	res = pgfdw_get_result(conn, buf.data);
+	res = pgfdw_get_result(entry, buf.data);
 	if (PQresultStatus(res) != PGRES_COMMAND_OK)
 		pgfdw_report_error(ERROR, res, conn, true, fsstate->query);
 	PQclear(res);
@@ -3152,7 +3161,8 @@ fetch_more_data(ForeignScanState *node)
 	/* PGresult must be released before leaving this function. */
 	PG_TRY();
 	{
-		PGconn	   *conn = fsstate->conn;
+		ConnCacheEntry *entry = fsstate->conn_entry;
+		PGconn	   *conn = ConnectionEntryGetConn(entry);
 		char		sql[64];
 		int			numrows;
 		int			i;
@@ -3160,7 +3170,7 @@ fetch_more_data(ForeignScanState *node)
 		snprintf(sql, sizeof(sql), "FETCH %d FROM c%u",
 				 fsstate->fetch_size, fsstate->cursor_number);
 
-		res = pgfdw_exec_query(conn, sql);
+		res = pgfdw_exec_query(entry, sql);
 		/* On error, report the original query, not the FETCH. */
 		if (PQresultStatus(res) != PGRES_TUPLES_OK)
 			pgfdw_report_error(ERROR, res, conn, false, fsstate->query);
@@ -3259,7 +3269,7 @@ reset_transmission_modes(int nestlevel)
  * Utility routine to close a cursor.
  */
 static void
-close_cursor(PGconn *conn, unsigned int cursor_number)
+close_cursor(ConnCacheEntry *entry, unsigned int cursor_number)
 {
 	char		sql[64];
 	PGresult   *res;
@@ -3270,9 +3280,9 @@ close_cursor(PGconn *conn, unsigned int cursor_number)
 	 * We don't use a PG_TRY block here, so be careful not to throw error
 	 * without releasing the PGresult.
 	 */
-	res = pgfdw_exec_query(conn, sql);
+	res = pgfdw_exec_query(entry, sql);
 	if (PQresultStatus(res) != PGRES_COMMAND_OK)
-		pgfdw_report_error(ERROR, res, conn, true, sql);
+		pgfdw_report_error(ERROR, res, ConnectionEntryGetConn(entry), true, sql);
 	PQclear(res);
 }
 
@@ -3318,7 +3328,7 @@ create_foreign_modify(EState *estate,
 	user = GetUserMapping(userid, table->serverid);
 
 	/* Open connection; report that we'll create a prepared statement. */
-	fmstate->conn = GetConnection(user, true);
+	fmstate->conn_entry = GetConnection(user, true);
 	fmstate->p_name = NULL;		/* prepared statement not made yet */
 
 	/* Set up remote query information. */
@@ -3387,11 +3397,13 @@ prepare_foreign_modify(PgFdwModifyState *fmstate)
 {
 	char		prep_name[NAMEDATALEN];
 	char	   *p_name;
+	ConnCacheEntry *entry = fmstate->conn_entry;
+	PGconn	   *conn = ConnectionEntryGetConn(entry);
 	PGresult   *res;
 
 	/* Construct name we'll use for the prepared statement. */
 	snprintf(prep_name, sizeof(prep_name), "pgsql_fdw_prep_%u",
-			 GetPrepStmtNumber(fmstate->conn));
+			 GetPrepStmtNumber(fmstate->conn_entry));
 	p_name = pstrdup(prep_name);
 
 	/*
@@ -3401,12 +3413,12 @@ prepare_foreign_modify(PgFdwModifyState *fmstate)
 	 * the prepared statements we use in this module are simple enough that
 	 * the remote server will make the right choices.
 	 */
-	if (!PQsendPrepare(fmstate->conn,
+	if (!PQsendPrepare(conn,
 					   p_name,
 					   fmstate->query,
 					   0,
 					   NULL))
-		pgfdw_report_error(ERROR, NULL, fmstate->conn, false, fmstate->query);
+		pgfdw_report_error(ERROR, NULL, conn, false, fmstate->query);
 
 	/*
 	 * Get the result, and check for success.
@@ -3414,9 +3426,9 @@ prepare_foreign_modify(PgFdwModifyState *fmstate)
 	 * We don't use a PG_TRY block here, so be careful not to throw error
 	 * without releasing the PGresult.
 	 */
-	res = pgfdw_get_result(fmstate->conn, fmstate->query);
+	res = pgfdw_get_result(entry, fmstate->query);
 	if (PQresultStatus(res) != PGRES_COMMAND_OK)
-		pgfdw_report_error(ERROR, res, fmstate->conn, true, fmstate->query);
+		pgfdw_report_error(ERROR, res, conn, true, fmstate->query);
 	PQclear(res);
 
 	/* This action shows that the prepare has been done. */
@@ -3541,16 +3553,18 @@ finish_foreign_modify(PgFdwModifyState *fmstate)
 		 * We don't use a PG_TRY block here, so be careful not to throw error
 		 * without releasing the PGresult.
 		 */
-		res = pgfdw_exec_query(fmstate->conn, sql);
+		res = pgfdw_exec_query(fmstate->conn_entry, sql);
 		if (PQresultStatus(res) != PGRES_COMMAND_OK)
-			pgfdw_report_error(ERROR, res, fmstate->conn, true, sql);
+			pgfdw_report_error(ERROR, res,
+							   ConnectionEntryGetConn(fmstate->conn_entry),
+							   true, sql);
 		PQclear(res);
 		fmstate->p_name = NULL;
 	}
 
 	/* Release remote connection */
-	ReleaseConnection(fmstate->conn);
-	fmstate->conn = NULL;
+	ReleaseConnection(fmstate->conn_entry);
+	fmstate->conn_entry = NULL;
 }
 
 /*
@@ -3690,6 +3704,8 @@ static void
 execute_dml_stmt(ForeignScanState *node)
 {
 	PgFdwDirectModifyState *dmstate = (PgFdwDirectModifyState *) node->fdw_state;
+	ConnCacheEntry *entry = dmstate->conn_entry;
+	PGconn		*conn = ConnectionEntryGetConn(entry);
 	ExprContext *econtext = node->ss.ps.ps_ExprContext;
 	int			numParams = dmstate->numParams;
 	const char **values = dmstate->param_values;
@@ -3710,9 +3726,9 @@ execute_dml_stmt(ForeignScanState *node)
 	 * the desired result.  This allows us to avoid assuming that the remote
 	 * server has the same OIDs we do for the parameters' types.
 	 */
-	if (!PQsendQueryParams(dmstate->conn, dmstate->query, numParams,
+	if (!PQsendQueryParams(conn, dmstate->query, numParams,
 						   NULL, values, NULL, NULL, 0))
-		pgfdw_report_error(ERROR, NULL, dmstate->conn, false, dmstate->query);
+		pgfdw_report_error(ERROR, NULL, conn, false, dmstate->query);
 
 	/*
 	 * Get the result, and check for success.
@@ -3720,10 +3736,10 @@ execute_dml_stmt(ForeignScanState *node)
 	 * We don't use a PG_TRY block here, so be careful not to throw error
 	 * without releasing the PGresult.
 	 */
-	dmstate->result = pgfdw_get_result(dmstate->conn, dmstate->query);
+	dmstate->result = pgfdw_get_result(entry, dmstate->query);
 	if (PQresultStatus(dmstate->result) !=
 		(dmstate->has_returning ? PGRES_TUPLES_OK : PGRES_COMMAND_OK))
-		pgfdw_report_error(ERROR, dmstate->result, dmstate->conn, true,
+		pgfdw_report_error(ERROR, dmstate->result, conn, true,
 						   dmstate->query);
 
 	/* Get the number of rows affected. */
@@ -4085,6 +4101,7 @@ postgresAnalyzeForeignTable(Relation relation,
 {
 	ForeignTable *table;
 	UserMapping *user;
+	ConnCacheEntry *entry;
 	PGconn	   *conn;
 	StringInfoData sql;
 	PGresult   *volatile res = NULL;
@@ -4105,7 +4122,8 @@ postgresAnalyzeForeignTable(Relation relation,
 	 */
 	table = GetForeignTable(RelationGetRelid(relation));
 	user = GetUserMapping(relation->rd_rel->relowner, table->serverid);
-	conn = GetConnection(user, false);
+	entry = GetConnection(user, false);
+	conn = ConnectionEntryGetConn(entry);
 
 	/*
 	 * Construct command to get page count for relation.
@@ -4116,7 +4134,7 @@ postgresAnalyzeForeignTable(Relation relation,
 	/* In what follows, do not risk leaking any PGresults. */
 	PG_TRY();
 	{
-		res = pgfdw_exec_query(conn, sql.data);
+		res = pgfdw_exec_query(entry, sql.data);
 		if (PQresultStatus(res) != PGRES_TUPLES_OK)
 			pgfdw_report_error(ERROR, res, conn, false, sql.data);
 
@@ -4135,7 +4153,7 @@ postgresAnalyzeForeignTable(Relation relation,
 	}
 	PG_END_TRY();
 
-	ReleaseConnection(conn);
+	ReleaseConnection(entry);
 
 	return true;
 }
@@ -4166,7 +4184,8 @@ postgresAcquireSampleRowsFunc(Relation relation, int elevel,
 	ForeignTable *table;
 	ForeignServer *server;
 	UserMapping *user;
-	PGconn	   *conn;
+	ConnCacheEntry *conn_entry;
+	PGconn *conn;
 	unsigned int cursor_number;
 	StringInfoData sql;
 	PGresult   *volatile res = NULL;
@@ -4195,12 +4214,13 @@ postgresAcquireSampleRowsFunc(Relation relation, int elevel,
 	table = GetForeignTable(RelationGetRelid(relation));
 	server = GetForeignServer(table->serverid);
 	user = GetUserMapping(relation->rd_rel->relowner, table->serverid);
-	conn = GetConnection(user, false);
+	conn_entry = GetConnection(user, false);
+	conn = ConnectionEntryGetConn(conn_entry);
 
 	/*
 	 * Construct cursor that retrieves whole rows from remote.
 	 */
-	cursor_number = GetCursorNumber(conn);
+	cursor_number = GetCursorNumber(conn_entry);
 	initStringInfo(&sql);
 	appendStringInfo(&sql, "DECLARE c%u CURSOR FOR ", cursor_number);
 	deparseAnalyzeSql(&sql, relation, &astate.retrieved_attrs);
@@ -4208,7 +4228,7 @@ postgresAcquireSampleRowsFunc(Relation relation, int elevel,
 	/* In what follows, do not risk leaking any PGresults. */
 	PG_TRY();
 	{
-		res = pgfdw_exec_query(conn, sql.data);
+		res = pgfdw_exec_query(conn_entry, sql.data);
 		if (PQresultStatus(res) != PGRES_COMMAND_OK)
 			pgfdw_report_error(ERROR, res, conn, false, sql.data);
 		PQclear(res);
@@ -4259,7 +4279,7 @@ postgresAcquireSampleRowsFunc(Relation relation, int elevel,
 			snprintf(fetch_sql, sizeof(fetch_sql), "FETCH %d FROM c%u",
 					 fetch_size, cursor_number);
 
-			res = pgfdw_exec_query(conn, fetch_sql);
+			res = pgfdw_exec_query(conn_entry, fetch_sql);
 			/* On error, report the original query, not the FETCH. */
 			if (PQresultStatus(res) != PGRES_TUPLES_OK)
 				pgfdw_report_error(ERROR, res, conn, false, sql.data);
@@ -4278,7 +4298,7 @@ postgresAcquireSampleRowsFunc(Relation relation, int elevel,
 		}
 
 		/* Close the cursor, just to be tidy. */
-		close_cursor(conn, cursor_number);
+		close_cursor(conn_entry, cursor_number);
 	}
 	PG_CATCH();
 	{
@@ -4288,7 +4308,7 @@ postgresAcquireSampleRowsFunc(Relation relation, int elevel,
 	}
 	PG_END_TRY();
 
-	ReleaseConnection(conn);
+	ReleaseConnection(conn_entry);
 
 	/* We assume that we have no dead tuple. */
 	*totaldeadrows = 0.0;
@@ -4388,6 +4408,7 @@ postgresImportForeignSchema(ImportForeignSchemaStmt *stmt, Oid serverOid)
 	bool		import_not_null = true;
 	ForeignServer *server;
 	UserMapping *mapping;
+	ConnCacheEntry *conn_entry;
 	PGconn	   *conn;
 	StringInfoData buf;
 	PGresult   *volatile res = NULL;
@@ -4418,7 +4439,8 @@ postgresImportForeignSchema(ImportForeignSchemaStmt *stmt, Oid serverOid)
 	 */
 	server = GetForeignServer(serverOid);
 	mapping = GetUserMapping(GetUserId(), server->serverid);
-	conn = GetConnection(mapping, false);
+	conn_entry = GetConnection(mapping, false);
+	conn = ConnectionEntryGetConn(conn_entry);
 
 	/* Don't attempt to import collation if remote server hasn't got it */
 	if (PQserverVersion(conn) < 90100)
@@ -4434,7 +4456,7 @@ postgresImportForeignSchema(ImportForeignSchemaStmt *stmt, Oid serverOid)
 		appendStringInfoString(&buf, "SELECT 1 FROM pg_catalog.pg_namespace WHERE nspname = ");
 		deparseStringLiteral(&buf, stmt->remote_schema);
 
-		res = pgfdw_exec_query(conn, buf.data);
+		res = pgfdw_exec_query(conn_entry, buf.data);
 		if (PQresultStatus(res) != PGRES_TUPLES_OK)
 			pgfdw_report_error(ERROR, res, conn, false, buf.data);
 
@@ -4546,7 +4568,7 @@ postgresImportForeignSchema(ImportForeignSchemaStmt *stmt, Oid serverOid)
 		appendStringInfoString(&buf, " ORDER BY c.relname, a.attnum");
 
 		/* Fetch the data */
-		res = pgfdw_exec_query(conn, buf.data);
+		res = pgfdw_exec_query(conn_entry, buf.data);
 		if (PQresultStatus(res) != PGRES_TUPLES_OK)
 			pgfdw_report_error(ERROR, res, conn, false, buf.data);
 
@@ -4652,7 +4674,7 @@ postgresImportForeignSchema(ImportForeignSchemaStmt *stmt, Oid serverOid)
 	}
 	PG_END_TRY();
 
-	ReleaseConnection(conn);
+	ReleaseConnection(conn_entry);
 
 	return commands;
 }
